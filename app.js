@@ -8,6 +8,13 @@
   };
   var MIN_FONT = 14, MAX_FONT = 30, STEP_FONT = 2, DEFAULT_FONT = 18;
 
+  var ICON_PLAY = '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg><span class="btn-label">Play</span>';
+  var ICON_PAUSE = '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M6 5h4v14H6zM14 5h4v14h-4z"/></svg><span class="btn-label">Pause</span>';
+
+  function prefersReduced() {
+    return !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+  }
+
   function init() {
     var els = {
       text: document.getElementById('text'),
@@ -21,18 +28,47 @@
       stop: document.getElementById('stop'),
       textSmaller: document.getElementById('textSmaller'),
       textLarger: document.getElementById('textLarger'),
+      reader: document.getElementById('reader'),
       status: document.getElementById('status'),
+      statusText: document.getElementById('statusText'),
       unsupported: document.getElementById('unsupported')
     };
 
     var voiceMap = {};            // voiceURI -> SpeechSynthesisVoice
     var fontSize = DEFAULT_FONT;
-    var lastProgress = '';        // last "Speaking… (chunk N of M)" for resume display
+    var lastProgress = '';        // last "Speaking…" line, for resume display
 
-    function setStatus(msg) { els.status.textContent = msg; }
+    function setStatus(msg) { els.statusText.textContent = msg; }
     function isEmpty() { return els.text.value.trim().length === 0; }
 
-    // ---- Unsupported browser (§10) ----
+    // ---- Reading view (§3.3): segments mirror the engine's chunks exactly ----
+    function buildReader(text) {
+      els.reader.innerHTML = '';
+      var segments = (typeof chunkText === 'function') ? chunkText(text, 200) : [];
+      segments.forEach(function (seg) {
+        var span = document.createElement('span');
+        span.className = 'seg';
+        span.textContent = seg;
+        els.reader.appendChild(span);
+        els.reader.appendChild(document.createTextNode(' '));
+      });
+      els.reader.hidden = segments.length === 0;
+    }
+    function clearReader() {
+      els.reader.innerHTML = '';
+      els.reader.hidden = true;
+    }
+    function highlightSegment(idx) {
+      var segs = els.reader.getElementsByClassName('seg');
+      for (var k = 0; k < segs.length; k++) segs[k].classList.remove('seg--active');
+      var active = segs[idx];
+      if (active) {
+        active.classList.add('seg--active');
+        active.scrollIntoView({ block: 'nearest', behavior: prefersReduced() ? 'auto' : 'smooth' });
+      }
+    }
+
+    // ---- Unsupported browser (§10 v1) ----
     if (!SpeechEngine.isSupported()) {
       els.unsupported.hidden = false;
       setStatus('');
@@ -42,12 +78,12 @@
       return;
     }
 
-    // ---- Voice dropdown (§8.2) ----
+    // ---- Voice dropdown (§8.2 v1) ----
     function friendlyLang(lang) { return FRIENDLY_LANG[lang] || lang; }
 
     function buildVoiceList(voices) {
       var local = voices.filter(function (v) { return v.localService; });
-      var pool = local.length ? local : voices;            // last-resort fallback
+      var pool = local.length ? local : voices;
       var english = pool.filter(function (v) {
         return v.lang && v.lang.toLowerCase().indexOf('en') === 0;
       });
@@ -86,7 +122,7 @@
       if (voices.length) { buildVoiceList(voices); refreshEmptyState(); }
     };
 
-    // ---- Sliders (§8.1) ----
+    // ---- Sliders (§8.1 v1) ----
     els.rate.addEventListener('input', function () {
       var v = parseFloat(els.rate.value).toFixed(1);
       els.rateOut.textContent = v + '×';
@@ -98,30 +134,32 @@
       els.pitch.setAttribute('aria-valuetext', 'pitch ' + v);
     });
 
-    // ---- Empty-text handling + finished->edit->Ready (§8.4) ----
+    // ---- Empty-text handling + finished->edit->Ready (§8.4 v1) ----
     function refreshEmptyState() {
-      if (SpeechEngine.getState() !== 'idle') return;       // only manage idle UI
+      if (SpeechEngine.getState() !== 'idle') return;
       var empty = isEmpty();
       els.playPause.disabled = empty;
       setStatus(empty ? 'Type or paste some text to begin' : 'Ready');
     }
     els.text.addEventListener('input', refreshEmptyState);
 
-    // ---- Engine state -> UI (§8.3) ----
+    // ---- Engine state -> UI (§8.3 v1 + §3.3 v2) ----
     SpeechEngine.onstatechange = function (state, info) {
+      els.status.classList.toggle('speaking', state === 'speaking');
       if (state === 'speaking') {
-        els.playPause.textContent = 'Pause';
+        els.playPause.innerHTML = ICON_PAUSE;
         els.playPause.disabled = false;
         els.stop.disabled = false;
       } else if (state === 'paused') {
-        els.playPause.textContent = 'Play';
+        els.playPause.innerHTML = ICON_PLAY;
         els.playPause.disabled = false;
         els.stop.disabled = false;
         setStatus('Paused');
       } else { // idle
-        els.playPause.textContent = 'Play';
+        els.playPause.innerHTML = ICON_PLAY;
         els.stop.disabled = true;
         els.playPause.disabled = isEmpty();
+        clearReader();
         var reason = info && info.reason;
         if (reason === 'finished') setStatus('Finished');
         else if (reason === 'error') setStatus('Something went wrong. Please try again.');
@@ -129,8 +167,9 @@
       }
     };
     SpeechEngine.onprogress = function (i, n) {
-      lastProgress = 'Speaking… (chunk ' + i + ' of ' + n + ')';
+      lastProgress = 'Speaking… (segment ' + i + ' of ' + n + ')';
       setStatus(lastProgress);
+      highlightSegment(i - 1);
     };
     SpeechEngine.onerror = function () { /* message set via onstatechange reason */ };
 
@@ -144,6 +183,7 @@
         setStatus(lastProgress || 'Speaking…');
       } else {
         if (isEmpty()) return;
+        buildReader(els.text.value);
         SpeechEngine.speak(els.text.value, {
           voice: selectedVoice(),
           rate: parseFloat(els.rate.value),
@@ -153,7 +193,7 @@
     });
     els.stop.addEventListener('click', function () { SpeechEngine.stop(); });
 
-    // ---- File upload (§7 consumer) ----
+    // ---- File upload (§7 v1 consumer) ----
     els.file.addEventListener('change', function () {
       var file = els.file.files && els.file.files[0];
       if (!file) return;
@@ -163,10 +203,10 @@
       }).catch(function (err) {
         setStatus(err.message || 'Could not read that file. Please try another.');
       });
-      els.file.value = '';                                  // allow re-uploading same file
+      els.file.value = '';
     });
 
-    // ---- Text size (§8.7) ----
+    // ---- Text size (§8.7 v1) ----
     function applyFontSize() {
       document.documentElement.style.setProperty('--reader-font-size', fontSize + 'px');
       els.textSmaller.disabled = fontSize <= MIN_FONT;
