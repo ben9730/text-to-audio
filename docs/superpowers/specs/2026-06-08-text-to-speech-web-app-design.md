@@ -33,7 +33,7 @@ Let a non-expert Windows user reliably hear arbitrary English text read aloud, f
 
 - **Browsers:** Microsoft Edge and Google Chrome (Chromium) on Windows 10/11. These ship local Microsoft voices (e.g. David, Zira, Mark) backed by the Windows speech engine and support the Web Speech API.
 - **Offline:** No network required. The app uses OS-level **local** voices (`localService === true`) only by default (see §8.2). No assets are fetched at runtime; everything is in the local files.
-- **Launch:** The user double-clicks `index.html`; it opens via the `file://` protocol and works directly. To keep `file://` working, `app.js` is loaded as a **classic script** (`<script src="app.js"></script>`, NOT `type="module"`), because ES modules are blocked by CORS on `file://` origins.
+- **Launch:** The user double-clicks `index.html`; it opens via the `file://` protocol and works directly. To keep `file://` working, all JavaScript is loaded as **classic scripts** (`<script src="…"></script>`, NOT `type="module"`), because ES modules are blocked by CORS on `file://` origins. The scripts load in dependency order — `chunk.js` → `speech-engine.js` → `file-loader.js` → `app.js` — and share the global scope (each exposes one global: `chunkText`, `SpeechEngine`, `loadTextFile`, and the Controller's `init`).
 - **Fallback:** If a particular browser/configuration blocks something over `file://`, the user can run a one-line local server from the project folder: `python -m http.server 8000`, then open `http://localhost:8000/`. This is documented as a backup only; it is not required for normal use.
 - **Known environmental limitations (documented, not engineered around in v1):**
   - Available voices differ per machine and per browser; the app never hard-codes voice names — it always builds the list from `getVoices()`.
@@ -50,11 +50,11 @@ Pure client-side. No frameworks. Four components, each with a single responsibil
 | Component | File(s) | Single responsibility |
 |---|---|---|
 | **UI** | `index.html`, `style.css` | Declarative markup and styling only: textarea, file input, voice `<select>`, speed/pitch sliders with value outputs, Play/Pause and Stop buttons, text-size (A− / A+) buttons, and a status line. `style.css` defines a light theme and an automatic dark theme via `prefers-color-scheme` (§8.7). The only DOM logic it triggers is the small text-size handler in the Controller. |
-| **Speech Engine** | `app.js` (namespace, e.g. `SpeechEngine`) | Wraps `window.speechSynthesis`. Owns voice loading (`voiceschanged`), the pure chunking call, building one utterance per chunk, queuing, and exposing `speak / pause / resume / stop / getVoices` plus state-change callbacks. Knows nothing about the DOM. |
-| **File Loader** | `app.js` (function `loadTextFile`) | Validates and reads an uploaded `.txt` via `FileReader`, normalizes the text, returns a `Promise<string>`. Knows nothing about speech. |
-| **Controller** | `app.js` (init/wiring code) | Wires UI events to the Speech Engine and File Loader, and keeps button/status state in sync via engine callbacks. The only component that touches both the DOM and the engine. |
+| **Speech Engine** | `speech-engine.js` (global `SpeechEngine`) | Wraps `window.speechSynthesis`. Owns voice loading (`voiceschanged`), the pure chunking call, building one utterance per chunk, queuing, and exposing `speak / pause / resume / stop / getVoices` plus state-change callbacks. Knows nothing about the DOM. |
+| **File Loader** | `file-loader.js` (global `loadTextFile`) | Validates and reads an uploaded `.txt` via `FileReader`, normalizes the text, returns a `Promise<string>`. Knows nothing about speech. |
+| **Controller** | `app.js` (global `init`, run on `DOMContentLoaded`) | Wires UI events to the Speech Engine and File Loader, and keeps button/status state in sync via engine callbacks. The only component that touches both the DOM and the engine. |
 
-The **pure chunking function** `chunkText(text, maxLen)` lives in `app.js` as a named, side-effect-free function (no DOM, no speech), so it is unit-testable in isolation (§9, §12).
+The **pure chunking function** `chunkText(text, maxLen)` lives in its own `chunk.js` as a named, side-effect-free function (no DOM, no speech). It is exposed as a browser global **and** via `module.exports` for Node, so it is unit-testable in isolation from both the browser test page and the terminal (§9, §12).
 
 Data flow: `UI event → Controller → (File Loader | Speech Engine) → Controller updates UI from engine callbacks`.
 
@@ -64,15 +64,20 @@ Data flow: `UI event → Controller → (File Loader | Speech Engine) → Contro
 
 ```
 text to audio/
-├─ index.html        # UI markup; loads style.css and app.js (classic script)
-├─ style.css         # All styling
-├─ app.js            # Speech Engine + File Loader + Controller + pure chunkText()
-├─ chunk.test.html   # Standalone unit test for chunkText() (open in browser)
+├─ index.html        # UI markup; loads style.css + the four classic scripts in order
+├─ style.css         # All styling, incl. light + auto-dark themes (§8.7)
+├─ chunk.js          # Pure chunkText() — no DOM, no speech. Browser global + Node export.
+├─ speech-engine.js  # SpeechEngine wrapping speechSynthesis (uses the chunkText global)
+├─ file-loader.js    # loadTextFile() via FileReader
+├─ app.js            # Controller: wires UI <-> engine/loader; init() on DOMContentLoaded
+├─ chunk.test.js     # Assertions for chunkText() — runs under Node AND in the browser
+├─ chunk.test.html   # Browser test page: loads chunk.js + chunk.test.js, renders PASS/FAIL
 └─ README.txt        # One-paragraph "how to run" for the non-expert user
 ```
 
-- **`app.js`** exposes `chunkText` on the global scope (`window.chunkText = chunkText;`) so the test page can call it without a module system (keeps `file://` working).
-- **`chunk.test.html`** is a single self-contained HTML file that includes `app.js` and a small assertion runner; opening it in a browser prints PASS/FAIL per case to the page and the console. No test framework, no Node, no install (see §12.1 for the exact cases).
+- **Load order in `index.html`** (classic `<script>` tags, no modules — keeps `file://` working): `chunk.js`, `speech-engine.js`, `file-loader.js`, `app.js`. Each defines one global; later files use earlier globals.
+- **`chunk.js`** ends with a dual export so the same source works everywhere: `if (typeof window !== 'undefined') window.chunkText = chunkText;` and `if (typeof module !== 'undefined' && module.exports) module.exports = { chunkText };`.
+- **`chunk.test.js`** holds the assertion cases (§12.1) and a tiny runner. Under **Node** (`node chunk.test.js`) it `require`s `./chunk.js`, prints PASS/FAIL per case, and exits non-zero on any failure (this is the developer/CI loop). In the **browser**, `chunk.test.html` loads `chunk.js` then `chunk.test.js`, and the runner renders the same results to the page. No test framework, no install. The **end user never runs tests** — Node is only a developer convenience.
 
 ---
 
@@ -294,7 +299,7 @@ The split decision is made **at** each terminator, before any cutting, so there 
 5. **Hard-split over-long sentences.** For any single sentence longer than `maxLen`: repeatedly take the substring up to `maxLen`, back up to the last whitespace within that window, and cut there; if there is no whitespace in the window (one giant token), cut at exactly `maxLen`. Continue until the remainder fits.
 6. **Finalize.** Trim each chunk; drop any empty after trimming. Return the array.
 
-The function is exposed globally (`window.chunkText`) so the test page can call it (§5, §12).
+`chunk.js` exposes `chunkText` as a browser global and via `module.exports` for Node, so both `chunk.test.html` and `node chunk.test.js` exercise the same function (§5, §12).
 
 ---
 
@@ -334,24 +339,25 @@ The function is exposed globally (`window.chunkText`) so the test page can call 
 
 ### 12.1 Automated unit test (the one required test) — `chunkText`
 
-Self-contained `chunk.test.html`: includes `app.js`, runs assertions against `window.chunkText`, prints PASS/FAIL per case to the page and `console`. No framework, no Node.
+Assertions live in `chunk.test.js` (the cases below) and run two ways against the **same** `chunkText`: `node chunk.test.js` in the terminal (exits non-zero on failure — the dev/CI loop), and `chunk.test.html` in a browser (loads `chunk.js` + `chunk.test.js`, renders PASS/FAIL to the page and `console`). No framework, no install; the end user never runs this.
 
 Helper used by assertions: `normalizeWords(s) = s.trim().split(/\s+/).filter(Boolean)`.
 
-| # | Input | Expected |
+Every case below is **observable from `chunkText`'s output** (chunks). Note that for short sentences that re-pack into one chunk, "was this `.` a boundary?" is only detectable when a wrong boundary inserts a *spurious space* — e.g. `3.14` → `3. 14` or `U.S.A.` → `U. S. A.`. Cases are chosen so the protection is actually testable, not hidden by re-packing.
+
+| # | Input | Expected (exact, unless noted) |
 |---|---|---|
 | 1 | `""` and `"   \n  "` | `[]` (both) |
-| 2 | `"Hello world. How are you?"` | `["Hello world. How are you?"]` — both sentences packed into one chunk; **exactly one space** between them |
-| 3 | `"Dr. Smith went home."` | one chunk; **not** split after `"Dr."` |
-| 4 | `"Pi is 3.14 exactly."` | one chunk; **not** split at the decimal |
-| 5 | `"It happened in the U.S.A. yesterday."` | one chunk; initialism `U.S.A.` not split into pieces |
+| 2 | `"Hello world. How are you?"` | `["Hello world. How are you?"]` — packed into one chunk with **exactly one space** between the sentences |
+| 3 | `"Dr. Smith went home."` | `["Dr. Smith went home."]` — abbreviation `Dr.` doesn't break packing; single chunk equals input |
+| 4 | `"Pi is 3.14 exactly."` | `["Pi is 3.14 exactly."]` — decimal **not** split (a wrong boundary would emit `"Pi is 3. 14 exactly."`) |
+| 5 | `"It happened in the U.S.A. yesterday."` | `["It happened in the U.S.A. yesterday."]` — initialism intact (a wrong boundary would emit `"... U. S. A. yesterday."`) |
 | 6 | A 600-char string of words with no `.!?` | multiple chunks, **each `length <= 200`**, split on spaces; `normalizeWords(join)` equals input words |
-| 7 | `"Line one\nLine two\nLine three"` | split at newlines into 3 logical pieces (packed if they fit under 200) |
-| 8 | `"Wait... really?! Yes."` | ellipsis not treated as 3 breaks; `?!` ends a sentence |
-| 9 | A sentence ending in a single capital **not** in the set, e.g. `"I gave it to B. Then I left."` | splits into 2 sentences (`B` is not an abbreviation member, so the period is a real boundary) — confirms only the listed initialism letters `U/S/A` are protected |
-| 10 | Any non-empty input | **invariants:** every `chunk.length <= 200` (allow one over-length only for a single whitespace-free token); no empty chunks; **no chunk contains `"  "` (double space)**; `normalizeWords(chunks.join(' '))` deep-equals `normalizeWords(input)` |
+| 7 | `"Line one\nLine two\nLine three"` | newlines act as boundaries; **no chunk contains a `\n`** (newlines become spaces); `normalizeWords(join)` equals input words |
+| 8 | `"Wait... really?! Yes."` | `["Wait... really?! Yes."]` — ellipsis not 3 breaks; `?!` ends one sentence; single chunk equals input |
+| 9 | Any non-empty input (run against cases 2–8) | **invariants:** every `chunk.length <= 200` (allow one over-length only for a single whitespace-free token); no empty chunks; **no chunk contains `"  "` (double space) or `"\n"`**; `normalizeWords(chunks.join(' '))` deep-equals `normalizeWords(input)` |
 
-> Note on the abbreviation set: only the single capitals `U/S/A` are protected (to keep `U.S.A.` intact). The known tradeoff is that a rare sentence ending in a lone `U.`, `S.`, or `A.` will over-merge with the next sentence; over-merging only yields a longer chunk (hard-split by step 5), never a dropped sentence. This is asserted, not hidden.
+> Note on the abbreviation set: only the single capitals `U/S/A` are protected (to keep `U.S.A.` intact). The tradeoff — a rare sentence ending in a lone `U.`, `S.`, or `A.` over-merging with the next — is **not separately asserted** because, like the middle-initial case (§9.2), re-packing makes it invisible at the chunk level (it only ever yields a longer chunk, hard-split by step 5, never a dropped word). The word-preservation invariant (case 9) guards against any actual word loss/duplication regardless.
 
 ### 12.2 Manual test checklist (Edge and Chrome on Windows, run offline)
 
@@ -379,7 +385,7 @@ Helper used by assertions: `normalizeWords(s) = s.trim().split(/\s+/).filter(Boo
 ## 13. How to Run
 
 ### Normal (recommended)
-1. Keep `index.html`, `style.css`, and `app.js` together in one folder.
+1. Keep all the files (`index.html`, `style.css`, `chunk.js`, `speech-engine.js`, `file-loader.js`, `app.js`) together in one folder.
 2. **Double-click `index.html`.** It opens in your default browser (use Microsoft Edge or Google Chrome on Windows).
 3. Type or paste text, or click "Upload a .txt file". Pick a voice, set speed/pitch, press **Play**. Works fully offline.
 
@@ -389,7 +395,8 @@ Helper used by assertions: `normalizeWords(s) = s.trim().split(/\s+/).filter(Boo
 3. Open `http://localhost:8000/` in Edge or Chrome. (Stop later with `Ctrl+C`.)
 
 ### Running the test
-- Double-click `chunk.test.html` and read the PASS/FAIL results on the page (and in the console via F12).
+- Quickest: in a terminal in the project folder, run `node chunk.test.js` → prints PASS/FAIL per case and exits non-zero if anything fails.
+- Or double-click `chunk.test.html` and read the PASS/FAIL results on the page (and in the console via F12). (The end user never needs to run tests.)
 
 > Notes for the user: voices come from Windows and differ per machine; for full offline use the app shows only the local Microsoft voices (e.g. David, Zira, Mark). Switching to another browser tab during a long read may pause speech in Chrome.
 
@@ -411,3 +418,4 @@ Helper used by assertions: `normalizeWords(s) = s.trim().split(/\s+/).filter(Boo
 - **Queue freed on natural completion** (§6.4): the final chunk's `onend` clears `queue` so a large file's utterances are released immediately rather than held until the next Play.
 - **Middle-initial quirk documented** (§9.2) as known-acceptable: a lone middle initial (e.g. `F.` in "John F. Kennedy") splits then re-packs into the same chunk — harmless for audio; only relevant to a future highlighting feature.
 - **Readability extras added** (§8.7, §8.1, §11, §12.2): text-size A−/A+ buttons (textarea only) and automatic dark mode via `prefers-color-scheme`. Pure CSS/UI; no dependencies; no effect on speech or file logic.
+- **File layout refined for the build** (§3, §4, §5, §12.1): the single `app.js` is split into four focused **classic-script** files (`chunk.js`, `speech-engine.js`, `file-loader.js`, `app.js`) realizing the four components — smaller files implement more reliably. `chunk.js` is dual-exported (browser global + Node `module.exports`) so the chunker's unit test runs both as `node chunk.test.js` (terminal/CI) and in `chunk.test.html` (browser). Still no build step, no runtime dependencies, no end-user Node requirement; `file://` double-click still works.
