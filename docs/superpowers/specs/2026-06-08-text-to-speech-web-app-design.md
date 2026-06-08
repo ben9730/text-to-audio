@@ -49,7 +49,7 @@ Pure client-side. No frameworks. Four components, each with a single responsibil
 
 | Component | File(s) | Single responsibility |
 |---|---|---|
-| **UI** | `index.html`, `style.css` | Declarative markup and styling only: textarea, file input, voice `<select>`, speed/pitch sliders with value outputs, Play/Pause and Stop buttons, and a status line. No logic. |
+| **UI** | `index.html`, `style.css` | Declarative markup and styling only: textarea, file input, voice `<select>`, speed/pitch sliders with value outputs, Play/Pause and Stop buttons, text-size (A− / A+) buttons, and a status line. `style.css` defines a light theme and an automatic dark theme via `prefers-color-scheme` (§8.7). The only DOM logic it triggers is the small text-size handler in the Controller. |
 | **Speech Engine** | `app.js` (namespace, e.g. `SpeechEngine`) | Wraps `window.speechSynthesis`. Owns voice loading (`voiceschanged`), the pure chunking call, building one utterance per chunk, queuing, and exposing `speak / pause / resume / stop / getVoices` plus state-change callbacks. Knows nothing about the DOM. |
 | **File Loader** | `app.js` (function `loadTextFile`) | Validates and reads an uploaded `.txt` via `FileReader`, normalizes the text, returns a `Promise<string>`. Knows nothing about speech. |
 | **Controller** | `app.js` (init/wiring code) | Wires UI events to the Speech Engine and File Loader, and keeps button/status state in sync via engine callbacks. The only component that touches both the DOM and the engine. |
@@ -136,7 +136,7 @@ Chromium silently cancels a single long utterance after ~15 seconds of speech (C
    - `wasActive ? setTimeout(enqueue, 100) : enqueue();`
 6. For **each** chunk `i`: create a **fresh** `new SpeechSynthesisUtterance(chunk)` (utterances are not reliably reusable across browsers), set `voice`, `rate`, `pitch`, `lang`; attach handlers (the index `i` is **captured in the closure** so progress is deterministic):
    - `utterance.onstart = () => { state='speaking'; onprogress(i + 1, chunkCount); onstatechange('speaking'); }`
-   - `utterance.onend = () => { endedCount++; if (endedCount === chunkCount && !selfCancelled) { state='idle'; onstatechange('idle', {reason:'finished'}); } }`
+   - `utterance.onend = () => { endedCount++; if (endedCount === chunkCount && !selfCancelled) { state='idle'; queue = []; onstatechange('idle', {reason:'finished'}); } }` — clearing `queue` here releases the utterance references the moment playback finishes (they were only held to defeat the GC bug, §6.4 intro), so a near-1 MB file's thousands of utterances are freed immediately instead of lingering until the next Play.
    - `utterance.onerror = (e) => { if (selfCancelled) return; /* suppress Stop-induced */ speechSynthesis.cancel(); state='idle'; onerror(e.error); onstatechange('idle', {reason:'error'}); }`
    - `queue.push(utterance); speechSynthesis.speak(utterance);`
 7. All chunks are enqueued up front; the browser's native FIFO queue plays them back-to-back for gapless playback (the engine does **not** wait for each `end` before speaking the next — that would add audible gaps).
@@ -203,6 +203,7 @@ On success, the Controller drops the resolved text into the textarea and re-runs
 | Pitch | `<input type="range" id="pitch" min="0.5" max="1.5" step="0.1" value="1">` | **1.0** | Maps to `utterance.pitch`. Positioned secondary to Speed. |
 | Play / Pause | `<button id="playPause">` | label "Play" | One button toggles label Play ⇄ Pause (also acts as Resume when paused). **This is a deliberate consolidation of the locked "Play / Pause" controls into a single toggle**, with Stop separate — the established accessible media-control pattern. |
 | Stop | `<button id="stop">` | disabled | Separate, always-distinct button. |
+| Text size | `<button id="textSmaller">A−</button>` `<button id="textLarger">A+</button>` | 18 px | Adjusts the textarea font size only (§8.7); never affects speech. |
 | Status | `<div id="status" role="status" aria-live="polite">` | "Ready" | Live region present at load (§8.4, §11). |
 
 Each slider has an associated `<output>` showing the live value (e.g. "1.0×" for speed, "1.0" for pitch), updated on `input`.
@@ -248,6 +249,13 @@ Remembering the last voice/speed/pitch via `localStorage` was considered and **d
 
 A small static hint near the controls: *"Tip: lower the speed for tricky text, raise it to skim."* Replaces a separate help screen for the non-expert audience.
 
+### 8.7 Readability: text size & theme
+
+Two pure-presentation features that do **not** touch the speech or file logic:
+
+- **Text size (A− / A+).** Two buttons adjust the **textarea's** font size only (the read-along surface). The Controller holds a current size, clamped to **14 px – 30 px, step 2 px, default 18 px**, applied via a CSS custom property (e.g. `--reader-font-size`) or `textarea.style.fontSize`. At a limit, the corresponding button is `disabled` (native). The size resets to 18 px each launch (no persistence, §8.5). This changes only on-screen text, never any `utterance` setting.
+- **Automatic dark mode.** `style.css` defines theme colors as CSS custom properties on `:root` (light) and overrides them inside `@media (prefers-color-scheme: dark)`. The app follows the Windows light/dark setting automatically — no toggle, no JavaScript, nothing to persist. Both themes must meet WCAG AA contrast for text, controls, and the status line (§11).
+
 ---
 
 ## 9. The Sentence-Chunking Function
@@ -280,6 +288,8 @@ The split decision is made **at** each terminator, before any cutting, so there 
    - (c) it is part of an ellipsis (`.` immediately preceded or followed by another `.`).
 
    These are intentionally pragmatic, **not** a full NLP tokenizer. The known tradeoff: over-protection can only *merge* two sentences into a longer run, which step 4 then hard-splits if needed — it can never **drop** a sentence. (Bare lowercase `a`/`m`/`p` are deliberately **excluded** from the set: the false-suppression of a real sentence break ending in "a." was judged worse than missing the rare `a.m.`/`p.m.` case.)
+
+   **Known-acceptable quirk — middle initials.** A single-letter middle initial not in the set (e.g. the `F.` in `"John F. Kennedy was the president."`) is treated as a sentence boundary. This is harmless for v1: the greedy packing in step 4 re-joins `"John F."` and `"Kennedy was the president."` into the **same** chunk with one separating space, so the spoken audio and the word-preservation invariant (§9.1) are unaffected — there is no audible gap. The only place this would matter is a future **word/sentence-highlighting** feature (out of scope, §2), which would need a smarter splitter; it is recorded here so that future work knows to revisit the abbreviation rules rather than assume sentence boundaries are linguistically exact.
 4. **Pack greedily.** Trim each closed raw sentence. Append the next sentence to the current chunk with exactly one separating space while `current.length + 1 + next.length <= maxLen`; when it would overflow, push `current` and start a new chunk with `next`. (Packing avoids one tiny utterance per short sentence, which would cause audible gaps.) Because raw sentences are trimmed first and joined with a single space, no chunk can contain a double space.
 5. **Hard-split over-long sentences.** For any single sentence longer than `maxLen`: repeatedly take the substring up to `maxLen`, back up to the last whitespace within that window, and cut there; if there is no whitespace in the window (one giant token), cut at exactly `maxLen`. Continue until the remainder fits.
 6. **Finalize.** Trim each chunk; drop any empty after trimming. Return the array.
@@ -315,7 +325,8 @@ The function is exposed globally (`window.chunkText`) so the test page can call 
 - **Status line.** A single `<div id="status" role="status" aria-live="polite">` exists in the DOM **at load** (so updates are announced) and is only mutated, never created on demand. Routine state uses polite, never assertive.
 - **Play/Pause toggling.** Toggle the button's **accessible name** (Play ⇄ Pause); do **not** use `aria-pressed` (it produces confusing output like "play button off"). Stop remains separate and always distinct.
 - **Disabled states.** Use the native `disabled` attribute for unavailable buttons (removes them from tab order); always pair a disabled Play with a status message explaining why.
-- **Focus.** Logical tab order: text → file → voice → speed → pitch → Play/Pause → Stop → status. Focus is not stolen during playback.
+- **Text-size & theme.** The A− / A+ buttons carry accessible names ("Decrease text size" / "Increase text size") beyond their visual glyphs, and each is `disabled` at its limit. Both the light theme and the automatic dark theme (`prefers-color-scheme`, §8.7) must satisfy WCAG AA contrast for text, controls, and status.
+- **Focus.** Logical tab order: text → file → voice → speed → pitch → Play/Pause → Stop → text size → status. Focus is not stolen during playback.
 
 ---
 
@@ -358,8 +369,10 @@ Helper used by assertions: `normalizeWords(s) = s.trim().split(/\s+/).filter(Boo
 12. Upload a non-`.txt` file → "Please choose a plain-text .txt file." Upload a > 1 MB file → "File too large (limit ~1 MB)." (no freeze).
 13. Upload a **near-1 MB** valid `.txt` → loads and begins playing without UI freeze while chunking ~1 M characters.
 14. Reload mid-playback → speech stops (no runaway audio); settings return to defaults (persistence is intentionally not in v1, §8.5).
-15. (Negative path) Temporarily stub `window.speechSynthesis` as undefined → unsupported banner shows, controls disabled.
-16. Re-run key steps via the `python -m http.server` fallback to confirm parity.
+15. Click A+ repeatedly then A− repeatedly → the textarea text grows/shrinks within 14–30 px; buttons clamp and disable at the limits; spoken output is unchanged.
+16. Set Windows to Dark mode (Settings → Personalization → Colors) and refresh → the app renders dark with readable contrast; switch Windows to Light → app renders light. No toggle needed.
+17. (Negative path) Temporarily stub `window.speechSynthesis` as undefined → unsupported banner shows, controls disabled.
+18. Re-run key steps via the `python -m http.server` fallback to confirm parity.
 
 ---
 
@@ -395,3 +408,6 @@ Helper used by assertions: `normalizeWords(s) = s.trim().split(/\s+/).filter(Boo
 - **Abbreviations set refined** (§9.2): case-insensitive; bare lowercase `a`/`m`/`p` dropped to avoid false-suppression; tradeoff documented and tested.
 - **Status `finished → edit → ?` transition closed** (§8.4); **resume softened to best-effort** (§3, §6.5, test 12.2.5); **near-1 MB file** manual test added (§7, 12.2.13).
 - **Scope decided in review** (§8.1, §8.5, §8.6): single Play/Pause toggle + separate Stop confirmed (deliberate consolidation of the locked "Play / Pause"); the inline tip is kept; **localStorage persistence was dropped from v1** (deferred — see §8.5 and the non-goals in §2).
+- **Queue freed on natural completion** (§6.4): the final chunk's `onend` clears `queue` so a large file's utterances are released immediately rather than held until the next Play.
+- **Middle-initial quirk documented** (§9.2) as known-acceptable: a lone middle initial (e.g. `F.` in "John F. Kennedy") splits then re-packs into the same chunk — harmless for audio; only relevant to a future highlighting feature.
+- **Readability extras added** (§8.7, §8.1, §11, §12.2): text-size A−/A+ buttons (textarea only) and automatic dark mode via `prefers-color-scheme`. Pure CSS/UI; no dependencies; no effect on speech or file logic.
