@@ -24,6 +24,7 @@ Let a non-expert Windows user reliably hear arbitrary English text read aloud, f
 - User accounts, login, or profiles.
 - Any server-side functionality (no backend, no database, no telemetry).
 - A volume control (utterance volume stays at its default; see §6.3).
+- Remembering settings between sessions — voice, speed, and pitch reset to their defaults on each launch (persistence was considered and deliberately deferred; see §8.5).
 - Languages other than English as a first-class concern (English voices are prioritized; the app does not translate or detect language).
 
 ---
@@ -51,7 +52,7 @@ Pure client-side. No frameworks. Four components, each with a single responsibil
 | **UI** | `index.html`, `style.css` | Declarative markup and styling only: textarea, file input, voice `<select>`, speed/pitch sliders with value outputs, Play/Pause and Stop buttons, and a status line. No logic. |
 | **Speech Engine** | `app.js` (namespace, e.g. `SpeechEngine`) | Wraps `window.speechSynthesis`. Owns voice loading (`voiceschanged`), the pure chunking call, building one utterance per chunk, queuing, and exposing `speak / pause / resume / stop / getVoices` plus state-change callbacks. Knows nothing about the DOM. |
 | **File Loader** | `app.js` (function `loadTextFile`) | Validates and reads an uploaded `.txt` via `FileReader`, normalizes the text, returns a `Promise<string>`. Knows nothing about speech. |
-| **Controller** | `app.js` (init/wiring code) | Wires UI events to the Speech Engine and File Loader, keeps button/status state in sync via engine callbacks, and reads/writes `localStorage`. The only component that touches both the DOM and the engine. |
+| **Controller** | `app.js` (init/wiring code) | Wires UI events to the Speech Engine and File Loader, and keeps button/status state in sync via engine callbacks. The only component that touches both the DOM and the engine. |
 
 The **pure chunking function** `chunkText(text, maxLen)` lives in `app.js` as a named, side-effect-free function (no DOM, no speech), so it is unit-testable in isolation (§9, §12).
 
@@ -214,7 +215,7 @@ On `loadVoices()` resolve and on every `onvoiceschanged`, the Controller **rebui
 2. **English filter:** keep voices where `voice.lang.toLowerCase().startsWith('en')` (covers en-US, en-GB, en-AU, en-IN, …). If this yields **zero** English voices, fall back to showing all candidate voices rather than an empty dropdown.
 3. **Order:** English voices first (alphabetical by display name), then any non-English fallback voices.
 4. `<option>` text = `` `${voice.name} (${friendlyLang})` ``, where `friendlyLang` maps codes to accent words: `en-US → "US English"`, `en-GB → "UK English"`, `en-AU → "Australian"`, `en-IN → "Indian English"`, `en-CA → "Canadian"`, `en-IE → "Irish"`, `en-ZA → "South African"`, `en-NZ → "New Zealand"`, otherwise the raw `lang`.
-5. **Default selection:** the platform default voice (`voice.default === true`) gets a `" — recommended"` suffix and is preselected on first run, **even if it is not first in the list**. On later runs, the persisted voice (§8.5) wins if it still exists.
+5. **Default selection:** the platform default voice (`voice.default === true`) gets a `" — recommended"` suffix and is preselected, **even if it is not first in the list**.
 6. `option.value = voice.voiceURI`; a JS `Map<voiceURI, voice>` resolves the selection back to the live `SpeechSynthesisVoice` object before speaking (voiceURI is more stable than name).
 
 ### 8.3 Button & status state machine
@@ -239,13 +240,11 @@ The Play/Pause toggle changes the **accessible name** (Play ⇄ Pause), **not** 
 - If empty/whitespace-only: disable Play (native `disabled`) and set status to **"Type or paste some text to begin"**. The engine is never asked to `speak('')`.
 - **Editing after a read:** any `input` event re-runs this check and **resets the status**, overriding a lingering "Finished" — to "Ready" when non-empty, or the empty-text message when empty. This closes the `finished → edit → ?` gap.
 
-### 8.5 Persistence (localStorage) — *small addition beyond the locked control list; see §13 changelog note*
+### 8.5 Persistence — deferred (NOT in v1)
 
-- On change of voice/rate/pitch, the Controller writes `{ voiceURI, rate, pitch }` to `localStorage` (values stored as strings; **never** the voice object — it is non-serializable and session-specific).
-- On startup, after voices load, it restores `rate`/`pitch` directly and re-resolves the saved `voiceURI` to a live voice; if that voice no longer exists, it falls back to the default voice.
-- All `localStorage` reads/writes are wrapped in `try/catch` because `file://` origins and private windows can throw or partition storage. On failure the app degrades to in-memory defaults and never crashes.
+Remembering the last voice/speed/pitch via `localStorage` was considered and **deliberately deferred** (owner decision during spec review). v1 starts every session with the defaults from §8.1 (speed 1.0, pitch 1.0, the platform "— recommended" voice). No `localStorage` is read or written. This keeps the offline `file://` surface simple and avoids the storage-partitioning edge cases. It can be added later without changing any other component.
 
-### 8.6 Inline hint — *small addition; see §13 note*
+### 8.6 Inline hint
 
 A small static hint near the controls: *"Tip: lower the speed for tricky text, raise it to skim."* Replaces a separate help screen for the non-expert audience.
 
@@ -358,10 +357,9 @@ Helper used by assertions: `normalizeWords(s) = s.trim().split(/\s+/).filter(Boo
 11. Upload a valid `.txt` (incl. one with CRLF line endings and one with a BOM) → contents load cleanly; play correctly.
 12. Upload a non-`.txt` file → "Please choose a plain-text .txt file." Upload a > 1 MB file → "File too large (limit ~1 MB)." (no freeze).
 13. Upload a **near-1 MB** valid `.txt` → loads and begins playing without UI freeze while chunking ~1 M characters.
-14. Reload mid-playback → speech stops (no runaway audio); voice/rate/pitch restored from last session.
-15. Reload after a settings change → saved voice/rate/pitch restored; if a saved voice is missing, falls back to default without error.
-16. (Negative path) Temporarily stub `window.speechSynthesis` as undefined → unsupported banner shows, controls disabled.
-17. Re-run key steps via the `python -m http.server` fallback to confirm parity.
+14. Reload mid-playback → speech stops (no runaway audio); settings return to defaults (persistence is intentionally not in v1, §8.5).
+15. (Negative path) Temporarily stub `window.speechSynthesis` as undefined → unsupported banner shows, controls disabled.
+16. Re-run key steps via the `python -m http.server` fallback to confirm parity.
 
 ---
 
@@ -396,4 +394,4 @@ Helper used by assertions: `normalizeWords(s) = s.trim().split(/\s+/).filter(Boo
 - **Engine vs UI states clarified** (§6.1, §8.3): engine is idle/speaking/paused; "Finished"/"Error"/"Ready-after-Stop" are idle presented with a `reason`.
 - **Abbreviations set refined** (§9.2): case-insensitive; bare lowercase `a`/`m`/`p` dropped to avoid false-suppression; tradeoff documented and tested.
 - **Status `finished → edit → ?` transition closed** (§8.4); **resume softened to best-effort** (§3, §6.5, test 12.2.5); **near-1 MB file** manual test added (§7, 12.2.13).
-- **Scope notes** (§8.1, §8.5, §8.6): single Play/Pause toggle marked a deliberate consolidation of the locked "Play / Pause"; localStorage persistence and the inline tip flagged as small additions beyond the locked control list (pending owner confirmation in review).
+- **Scope decided in review** (§8.1, §8.5, §8.6): single Play/Pause toggle + separate Stop confirmed (deliberate consolidation of the locked "Play / Pause"); the inline tip is kept; **localStorage persistence was dropped from v1** (deferred — see §8.5 and the non-goals in §2).
