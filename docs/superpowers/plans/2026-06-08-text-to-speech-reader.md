@@ -327,7 +327,7 @@ git commit -m "test: add browser test page for chunkText"
 **Files:**
 - Create: `speech-engine.js`
 
-Implements §6 exactly: voice loading with the `voiceschanged` race fix (§6.2), the precise `speak()` sequence and counted completion (§6.4), and pause/resume/stop with the self-cancel + wedged-pause guards (§6.5).
+Implements §6 exactly: voice loading with the `voiceschanged` race fix **plus a persistent listener** (§6.2), the precise `speak()` sequence and counted completion (§6.4), and pause/resume/stop with **generation-based stale-event suppression** and the wedged-pause guard (§6.5). The generation counter (bumped on each `speak()`/`stop()`/genuine error) makes cancel-induced events from superseded utterances no-op, so Stop/replace never leak a spurious error and a real mid-queue error fires exactly once.
 
 - [ ] **Step 1: Write `speech-engine.js`**
 
@@ -345,7 +345,7 @@ var SpeechEngine = (function () {
   var chunkCount = 0;
   var endedCount = 0;
   var state = 'idle';      // 'idle' | 'speaking' | 'paused'
-  var selfCancelled = false;
+  var generation = 0;      // bumped on each speak()/stop()/genuine error; stale callbacks no-op
 
   var api = {
     onstatechange: null, onprogress: null, onerror: null, onvoiceschanged: null
@@ -401,7 +401,8 @@ var SpeechEngine = (function () {
 
     var wasActive = synth.speaking || synth.paused;
 
-    selfCancelled = true;       // suppress the error from cancelling existing speech
+    generation++;               // invalidate any in-flight utterance callbacks
+    var myGen = generation;
     synth.cancel();
     if (synth.paused) synth.resume();
 
@@ -410,7 +411,7 @@ var SpeechEngine = (function () {
     chunkCount = chunks.length;
 
     function enqueue() {
-      selfCancelled = false;    // from here on, errors are real
+      if (myGen !== generation) return;   // a newer speak()/stop() superseded us
       chunks.forEach(function (chunk, index) {
         var u = new SpeechSynthesisUtterance(chunk);
         if (opts.voice) { u.voice = opts.voice; u.lang = opts.voice.lang; }
@@ -418,21 +419,25 @@ var SpeechEngine = (function () {
         u.pitch = (opts.pitch != null) ? opts.pitch : 1;
 
         u.onstart = function () {
+          if (myGen !== generation) return;
           state = 'speaking';
           if (typeof api.onprogress === 'function') api.onprogress(index + 1, chunkCount);
           emitState();
         };
         u.onend = function () {
+          if (myGen !== generation) return;   // stale (cancelled) utterance
           endedCount++;
-          if (endedCount === chunkCount && !selfCancelled) {
+          if (endedCount === chunkCount) {
             state = 'idle';
             queue = [];          // release utterances immediately on completion (§6.4)
             emitState({ reason: 'finished' });
           }
         };
         u.onerror = function (e) {
-          if (selfCancelled) return;   // intentional Stop/replace, not a real error
+          if (myGen !== generation) return;   // stale cancel-induced error: ignore
+          generation++;          // invalidate the remaining siblings so this fires once
           synth.cancel();
+          queue = []; endedCount = 0; chunkCount = 0;
           state = 'idle';
           if (typeof api.onerror === 'function') api.onerror((e && e.error) || 'unknown');
           emitState({ reason: 'error' });
@@ -447,14 +452,14 @@ var SpeechEngine = (function () {
   }
 
   function pause() {
-    if (!isSupported() || !synth.speaking) return;
+    if (!isSupported() || state !== 'speaking') return;   // self-protecting guard
     synth.pause();
     state = 'paused';
     emitState();
   }
 
   function resume() {
-    if (!isSupported()) return;
+    if (!isSupported() || state !== 'paused') return;      // self-protecting guard
     synth.resume();
     state = 'speaking';
     emitState();
@@ -462,7 +467,7 @@ var SpeechEngine = (function () {
 
   function stop() {
     if (!isSupported()) return;
-    selfCancelled = true;
+    generation++;                    // invalidate all in-flight utterance callbacks
     var wasPaused = synth.paused;
     synth.cancel();
     if (wasPaused) synth.resume();   // avoid wedged-paused state (§6.5)
@@ -471,7 +476,13 @@ var SpeechEngine = (function () {
     chunkCount = 0;
     state = 'idle';
     emitState({ reason: 'stopped' });
-    setTimeout(function () { selfCancelled = false; }, 0);
+  }
+
+  // Persistent voiceschanged listener (§6.2): keeps the voice list fresh for the
+  // whole session, separate from loadVoices()'s temporary one. populateVoices is
+  // idempotent and re-fires onvoiceschanged so the Controller can rebuild the list.
+  if (synth && synth.addEventListener) {
+    synth.addEventListener('voiceschanged', populateVoices);
   }
 
   if (typeof window !== 'undefined') {
@@ -613,13 +624,13 @@ Every control from §8.1, the unsupported banner, the inline hint, the `role="st
       <div class="control">
         <label for="rate">Speed</label>
         <input type="range" id="rate" min="0.5" max="2" step="0.1" value="1"
-          aria-valuetext="1 times normal speed" />
+          aria-valuetext="1.0 times normal speed" />
         <output id="rateOut" for="rate">1.0&times;</output>
       </div>
       <div class="control">
         <label for="pitch">Pitch</label>
         <input type="range" id="pitch" min="0.5" max="1.5" step="0.1" value="1"
-          aria-valuetext="pitch 1" />
+          aria-valuetext="pitch 1.0" />
         <output id="pitchOut" for="pitch">1.0</output>
       </div>
     </div>
@@ -805,6 +816,7 @@ Wires the UI to `SpeechEngine` and `loadTextFile`. Implements: unsupported-brows
 
     var voiceMap = {};            // voiceURI -> SpeechSynthesisVoice
     var fontSize = DEFAULT_FONT;
+    var lastProgress = '';        // last "Speaking… (chunk N of M)" for resume display
 
     function setStatus(msg) { els.status.textContent = msg; }
     function isEmpty() { return els.text.value.trim().length === 0; }
@@ -860,17 +872,19 @@ Wires the UI to `SpeechEngine` and `loadTextFile`. Implements: unsupported-brows
       refreshEmptyState();
     });
     SpeechEngine.onvoiceschanged = function (voices) {
-      if (voices.length) buildVoiceList(voices);
+      if (voices.length) { buildVoiceList(voices); refreshEmptyState(); }
     };
 
     // ---- Sliders (§8.1) ----
     els.rate.addEventListener('input', function () {
-      els.rateOut.textContent = parseFloat(els.rate.value).toFixed(1) + '×';
-      els.rate.setAttribute('aria-valuetext', els.rate.value + ' times normal speed');
+      var v = parseFloat(els.rate.value).toFixed(1);
+      els.rateOut.textContent = v + '×';
+      els.rate.setAttribute('aria-valuetext', v + ' times normal speed');
     });
     els.pitch.addEventListener('input', function () {
-      els.pitchOut.textContent = parseFloat(els.pitch.value).toFixed(1);
-      els.pitch.setAttribute('aria-valuetext', 'pitch ' + els.pitch.value);
+      var v = parseFloat(els.pitch.value).toFixed(1);
+      els.pitchOut.textContent = v;
+      els.pitch.setAttribute('aria-valuetext', 'pitch ' + v);
     });
 
     // ---- Empty-text handling + finished->edit->Ready (§8.4) ----
@@ -904,7 +918,8 @@ Wires the UI to `SpeechEngine` and `loadTextFile`. Implements: unsupported-brows
       }
     };
     SpeechEngine.onprogress = function (i, n) {
-      setStatus('Speaking… (chunk ' + i + ' of ' + n + ')');
+      lastProgress = 'Speaking… (chunk ' + i + ' of ' + n + ')';
+      setStatus(lastProgress);
     };
     SpeechEngine.onerror = function () { /* message set via onstatechange reason */ };
 
@@ -915,7 +930,7 @@ Wires the UI to `SpeechEngine` and `loadTextFile`. Implements: unsupported-brows
         SpeechEngine.pause();
       } else if (state === 'paused') {
         SpeechEngine.resume();
-        setStatus('Speaking…');
+        setStatus(lastProgress || 'Speaking…');
       } else {
         if (isEmpty()) return;
         SpeechEngine.speak(els.text.value, {
@@ -942,7 +957,7 @@ Wires the UI to `SpeechEngine` and `loadTextFile`. Implements: unsupported-brows
 
     // ---- Text size (§8.7) ----
     function applyFontSize() {
-      els.text.style.fontSize = fontSize + 'px';
+      document.documentElement.style.setProperty('--reader-font-size', fontSize + 'px');
       els.textSmaller.disabled = fontSize <= MIN_FONT;
       els.textLarger.disabled = fontSize >= MAX_FONT;
     }
@@ -1035,8 +1050,8 @@ Double-click `chunk.test.html`. Expected: the page shows `chunkText tests: 14/14
 
 - [ ] **Step 3: Run the core manual checklist in BOTH Edge and Chrome (offline)** — full list in spec §12.2; the must-pass smoke tests:
 
-  1. Double-click `index.html` → status "Ready"; the voice dropdown fills within ~1.5 s with English voices, the default marked "— recommended".
-  2. Empty textarea → **Play disabled**, status "Type or paste some text to begin".
+  1. Double-click `index.html` → the voice dropdown fills within ~1.5 s with English voices, the default marked "— recommended". With the textarea empty (the open state), **Play is disabled** and the status reads "Type or paste some text to begin".
+  2. Type one character then delete it (textarea empty again) → Play stays disabled, status stays the empty-text prompt.
   3. Type a sentence → Play enables; click Play → audio plays, button shows "Pause", Stop enabled, status shows "Speaking… (chunk N of M)".
   4. Pause → audio stops, status "Paused", button "Play"; click Play → resumes.
   5. Stop mid-playback → audio stops, status "Ready", Stop disabled; click Play again → plays from the start (no wedged-paused silence).
@@ -1048,6 +1063,8 @@ Double-click `chunk.test.html`. Expected: the page shows `chunkText tests: 14/14
   11. Click A+ several times, then A− → textarea text grows/shrinks within 14–30 px; buttons disable at the limits; audio unchanged.
   12. Set Windows to Dark mode and refresh → the app renders dark with readable contrast; switch to Light → renders light.
   13. Reload mid-playback → speech stops (no runaway audio).
+  14. Upload a **near-1 MB** valid `.txt` (≈ 900 KB of prose) → it loads and begins playing without the UI freezing while it chunks ~1 M characters (covers spec §12.2.13).
+  15. (Negative path) In the console, run `window.speechSynthesis = undefined` then reload, OR temporarily edit `SpeechEngine.isSupported` to return `false` → the unsupported banner shows and all controls are disabled (covers spec §12.2.17 / §10).
 
 - [ ] **Step 4: If any check fails, fix in the relevant file and re-verify** (re-run `node chunk.test.js` if the chunker changed; re-run the affected manual step). Use superpowers:systematic-debugging for any non-obvious failure. Commit each fix:
 
@@ -1069,5 +1086,5 @@ git commit -m "chore: text-to-speech reader v1 complete"
 
 - **Spec coverage:** §3 launch/classic-scripts → Task 5 (`index.html` script order); §6 SpeechEngine (voice load race, speak sequence, counted completion, pause/resume/stop guards, beforeunload) → Task 3; §7 file loader → Task 4; §8.1 controls/defaults/ranges → Tasks 5–7; §8.2 voice precedence → Task 7 `buildVoiceList`; §8.3 state machine → Task 7 `onstatechange`; §8.4 empty-text + finished→edit→Ready → Task 7 `refreshEmptyState`; §8.6 hint → Task 5; §8.7 text size + auto dark → Tasks 6–7; §9 chunker → Task 1; §10 error cases → Tasks 3/4/7; §11 a11y (labels, live region, aria-valuetext, accessible A−/A+ names) → Tasks 5–7; §12.1 chunker test → Tasks 1–2; §12.2 manual checklist → Task 9; §13 run instructions → Task 8.
 - **Placeholder scan:** no TBD/TODO; every code step contains complete file content.
-- **Type/name consistency:** globals `chunkText`, `SpeechEngine`, `loadTextFile` and the engine callbacks (`onstatechange(state, info)`, `onprogress(i, n)`, `onerror`, `onvoiceschanged`) are defined in Tasks 1/3/4 and consumed with the same names/signatures in Task 7. Element IDs in `index.html` (Task 5) match `document.getElementById` lookups in `app.js` (Task 7): `text, file, voice, rate, rateOut, pitch, pitchOut, playPause, stop, textSmaller, textLarger, status, unsupported`. CSS var `--reader-font-size` (Task 6) is the same surface the text-size buttons drive (Task 7 sets `els.text.style.fontSize`).
+- **Type/name consistency:** globals `chunkText`, `SpeechEngine`, `loadTextFile` and the engine callbacks (`onstatechange(state, info)`, `onprogress(i, n)`, `onerror`, `onvoiceschanged`) are defined in Tasks 1/3/4 and consumed with the same names/signatures in Task 7. Element IDs in `index.html` (Task 5) match `document.getElementById` lookups in `app.js` (Task 7): `text, file, voice, rate, rateOut, pitch, pitchOut, playPause, stop, textSmaller, textLarger, status, unsupported`. CSS var `--reader-font-size` is defined on `:root` (Task 6, default 18px) and consumed by the textarea; the text-size buttons drive it by calling `document.documentElement.style.setProperty('--reader-font-size', …)` (Task 7), keeping a single source of truth.
 - **Out-of-scope confirmed absent:** no audio export, no word highlighting, no cloud/AI voices, no localStorage persistence, no backend.
