@@ -1,0 +1,8 @@
+# UI UX Pro Max design skill (dev tooling, not part of the app)
+.claude/
+# Python caches
+__pycache__/
+*.pyc
+# OS / editor cruft
+Thumbs.db
+.DS_Store
