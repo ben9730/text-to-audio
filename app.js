@@ -82,12 +82,13 @@
     function friendlyLang(lang) { return FRIENDLY_LANG[lang] || lang; }
 
     function buildVoiceList(voices) {
-      var local = voices.filter(function (v) { return v.localService; });
-      var pool = local.length ? local : voices;
-      var english = pool.filter(function (v) {
+      var english = voices.filter(function (v) {
         return v.lang && v.lang.toLowerCase().indexOf('en') === 0;
       });
-      var chosen = (english.length ? english : pool).slice().sort(function (a, b) {
+      var pool = english.length ? english : voices;
+      // Local (offline) voices sort before online voices; alphabetical within each group.
+      var chosen = pool.slice().sort(function (a, b) {
+        if (a.localService !== b.localService) return a.localService ? -1 : 1;
         return a.name.localeCompare(b.name);
       });
 
