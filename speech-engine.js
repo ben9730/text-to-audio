@@ -13,6 +13,13 @@ var SpeechEngine = (function () {
   var state = 'idle';      // 'idle' | 'speaking' | 'paused'
   var generation = 0;      // bumped on each speak()/stop()/genuine error; stale callbacks no-op
 
+  // Pause state: saved so resume() can re-enqueue remaining chunks.
+  // Mobile browsers don't reliably support synth.pause()/resume(), so we
+  // simulate pause by cancelling and replaying from the last known position.
+  var savedChunks = [];
+  var savedOpts = {};
+  var pausedChunkIndex = 0;
+
   var api = {
     onstatechange: null, onprogress: null, onerror: null, onvoiceschanged: null
   };
@@ -59,94 +66,124 @@ var SpeechEngine = (function () {
   function getVoices() { return voices; }
   function getState() { return state; }
 
+  // Create utterances for `chunks` and feed them to synth.
+  // `offset` is the index in savedChunks where this slice begins — used to
+  // keep onprogress numbers and pausedChunkIndex consistent across resumes.
+  function enqueueFrom(chunks, opts, offset, myGen) {
+    queue = [];
+    endedCount = offset;
+    chunkCount = savedChunks.length;
+
+    chunks.forEach(function (chunk, i) {
+      var index = offset + i;
+      var u = new SpeechSynthesisUtterance(chunk);
+      if (opts.voice) { u.voice = opts.voice; u.lang = opts.voice.lang; }
+      u.rate = (opts.rate != null) ? opts.rate : 1;
+      u.pitch = (opts.pitch != null) ? opts.pitch : 1;
+
+      u.onstart = function () {
+        if (myGen !== generation) return;
+        state = 'speaking';
+        pausedChunkIndex = index;
+        if (typeof api.onprogress === 'function') api.onprogress(index + 1, chunkCount);
+        emitState();
+      };
+      u.onend = function () {
+        if (myGen !== generation) return;
+        endedCount++;
+        if (endedCount === chunkCount) {
+          state = 'idle';
+          queue = [];
+          emitState({ reason: 'finished' });
+        }
+      };
+      u.onerror = function (e) {
+        if (myGen !== generation) return;
+        generation++;
+        synth.cancel();
+        queue = []; endedCount = 0; chunkCount = 0;
+        state = 'idle';
+        if (typeof api.onerror === 'function') api.onerror((e && e.error) || 'unknown');
+        emitState({ reason: 'error' });
+      };
+
+      queue.push(u);
+      synth.speak(u);
+    });
+  }
+
   function speak(text, opts) {
     if (!isSupported()) return;
     opts = opts || {};
     var chunks = (typeof chunkText === 'function') ? chunkText(text, 200) : [text];
     if (!chunks.length) return;
 
+    savedChunks = chunks;
+    savedOpts = opts;
+    pausedChunkIndex = 0;
+
     var wasActive = synth.speaking || synth.paused;
 
-    generation++;               // invalidate any in-flight utterance callbacks
+    generation++;
     var myGen = generation;
     synth.cancel();
     if (synth.paused) synth.resume();
 
-    queue = [];
-    endedCount = 0;
-    chunkCount = chunks.length;
-
-    function enqueue() {
-      if (myGen !== generation) return;   // a newer speak()/stop() superseded us
-      chunks.forEach(function (chunk, index) {
-        var u = new SpeechSynthesisUtterance(chunk);
-        if (opts.voice) { u.voice = opts.voice; u.lang = opts.voice.lang; }
-        u.rate = (opts.rate != null) ? opts.rate : 1;
-        u.pitch = (opts.pitch != null) ? opts.pitch : 1;
-
-        u.onstart = function () {
-          if (myGen !== generation) return;
-          state = 'speaking';
-          if (typeof api.onprogress === 'function') api.onprogress(index + 1, chunkCount);
-          emitState();
-        };
-        u.onend = function () {
-          if (myGen !== generation) return;   // stale (cancelled) utterance
-          endedCount++;
-          if (endedCount === chunkCount) {
-            state = 'idle';
-            queue = [];          // release utterances immediately on completion (§6.4)
-            emitState({ reason: 'finished' });
-          }
-        };
-        u.onerror = function (e) {
-          if (myGen !== generation) return;   // stale cancel-induced error: ignore
-          generation++;          // invalidate the remaining siblings so this fires once
-          synth.cancel();
-          queue = []; endedCount = 0; chunkCount = 0;
-          state = 'idle';
-          if (typeof api.onerror === 'function') api.onerror((e && e.error) || 'unknown');
-          emitState({ reason: 'error' });
-        };
-
-        queue.push(u);
-        synth.speak(u);
-      });
+    function doEnqueue() {
+      if (myGen !== generation) return;
+      enqueueFrom(chunks, opts, 0, myGen);
     }
 
-    if (wasActive) setTimeout(enqueue, 100); else enqueue();
+    if (wasActive) setTimeout(doEnqueue, 100); else doEnqueue();
   }
 
   function pause() {
-    if (!isSupported() || state !== 'speaking') return;   // self-protecting guard
-    synth.pause();
+    if (!isSupported() || state !== 'speaking') return;
+    // Cancel is the only reliable cross-platform way to stop playback.
+    // pausedChunkIndex was updated by the last onstart, so resume() can
+    // re-enqueue from exactly that chunk.
+    generation++;
+    synth.cancel();
+    if (synth.paused) synth.resume();   // clear any stuck paused state
     state = 'paused';
     emitState();
   }
 
   function resume() {
-    if (!isSupported() || state !== 'paused') return;      // self-protecting guard
-    synth.resume();
+    if (!isSupported() || state !== 'paused') return;
+    if (!savedChunks.length) return;
+
+    var resumeChunks = savedChunks.slice(pausedChunkIndex);
+    if (!resumeChunks.length) {
+      state = 'idle';
+      emitState({ reason: 'finished' });
+      return;
+    }
+
+    generation++;
+    var myGen = generation;
     state = 'speaking';
     emitState();
+
+    enqueueFrom(resumeChunks, savedOpts, pausedChunkIndex, myGen);
   }
 
   function stop() {
     if (!isSupported()) return;
-    generation++;                    // invalidate all in-flight utterance callbacks
+    generation++;
     var wasPaused = synth.paused;
     synth.cancel();
     if (wasPaused) synth.resume();   // avoid wedged-paused state (§6.5)
     queue = [];
     endedCount = 0;
     chunkCount = 0;
+    savedChunks = [];
     state = 'idle';
     emitState({ reason: 'stopped' });
   }
 
   // Persistent voiceschanged listener (§6.2): keeps the voice list fresh for the
-  // whole session, separate from loadVoices()'s temporary one. populateVoices is
-  // idempotent and re-fires onvoiceschanged so the Controller can rebuild the list.
+  // whole session, separate from loadVoices()'s temporary one.
   if (synth && synth.addEventListener) {
     synth.addEventListener('voiceschanged', populateVoices);
   }
